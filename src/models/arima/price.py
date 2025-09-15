@@ -8,7 +8,9 @@ import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
 
 DATA_RAW = "data/raw/usdpln_yahoo_daily.csv"
-REPORT_PLOT_2025 = "data/reports/arima_usdpln_price_2025.png"
+REPORT_PLOT_2025 = "data/reports/arima/price_2025.png"
+METRICS_CSV = "data/reports/arima/metrics_price_2025.csv"
+TRAIN_END = pd.Timestamp("2024-12-31")
 
 def fetch_usdpln() -> pd.DataFrame:
     df = yf.download("USDPLN=X", interval="1d", auto_adjust=False, progress=False)
@@ -44,13 +46,35 @@ def load_or_fetch() -> pd.DataFrame:
 
 def prepare_series(df: pd.DataFrame) -> pd.Series:
     s = df["Close"].astype(float).sort_index()
-    s = s.asfreq("B").interpolate()
+    s = s.asfreq("B").ffill().bfill()
     return s
 
+def select_arima_order(series: pd.Series, p_range=(0,1,2), d_range=(0,1), q_range=(0,1,2)) -> Tuple[int,int,int]:
+    import warnings
+    from statsmodels.tools.sm_exceptions import ConvergenceWarning
+    best_aic = float("inf")
+    best = (1,1,1)
+    for p in p_range:
+        for d in d_range:
+            for q in q_range:
+                if p==0 and d==0 and q==0:
+                    continue
+                try:
+                    m = ARIMA(series, order=(p,d,q))
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        warnings.simplefilter("ignore", ConvergenceWarning)
+                        res = m.fit()
+                    if res.aic < best_aic:
+                        best_aic = res.aic
+                        best = (p,d,q)
+                except Exception:
+                    continue
+    return best
+
 def arima_forecast_values_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd.Series, pd.Series]:
-    series = series.copy().asfreq("B").interpolate()
-    train_end = pd.Timestamp("2024-12-31")
-    if series.index.min() > train_end:
+    series = series.copy().asfreq("B").ffill().bfill()
+    if series.index.min() > TRAIN_END:
         raise ValueError("Za mało historii: brak danych przed 2025")
     test_year = 2025
     test_idx = series.index[series.index.year == test_year]
@@ -66,7 +90,12 @@ def arima_forecast_values_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd.S
         prev_date = series.index[prev_idx_pos]
         train_series = series.loc[:prev_date]
         model = ARIMA(train_series, order=order)
-        fitted = model.fit()
+        import warnings as _w
+        from statsmodels.tools.sm_exceptions import ConvergenceWarning as _CW
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", UserWarning)
+            _w.simplefilter("ignore", _CW)
+            fitted = model.fit()
         pred = fitted.forecast(steps=1).iloc[-1]
         preds.append(pred)
         remaining = int(round(100 * (1 - (i + 1) / n)))
@@ -79,16 +108,22 @@ def arima_forecast_values_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd.S
 
 def main():
     os.makedirs("data/raw", exist_ok=True)
-    os.makedirs("data/reports", exist_ok=True)
+    os.makedirs("data/reports/arima", exist_ok=True)
     df = load_or_fetch()
     s = prepare_series(df)
     import argparse
     parser = argparse.ArgumentParser(description="Prognoza dokładnej ceny USD/PLN na 2025 z ARIMA")
     parser.add_argument("--tol-abs", type=float, default=0.02)
     parser.add_argument("--tol-pct", type=float, default=0.0)
+    parser.add_argument("--auto-aic", action="store_true")
     args = parser.parse_args()
-    print("ARIMA(1,1,1) USD/PLN — wartość 2025")
-    y_pred, y_true = arima_forecast_values_2025(s, order=(1, 1, 1))
+    order = (1,1,1)
+    if args.auto_aic:
+        base_train = s.loc[:TRAIN_END]
+        order = select_arima_order(base_train)
+        print(f"Wybrany porządek (AIC): {order}")
+    print(f"ARIMA{order} USD/PLN — wartość 2025")
+    y_pred, y_true = arima_forecast_values_2025(s, order=order)
     if args.tol_pct > 0:
         tol = y_true.abs() * (args.tol_pct / 100.0)
         tol_desc = f"{args.tol_pct:.3g}%"
@@ -99,10 +134,12 @@ def main():
     acc = float(correct.mean())
     pct = acc * 100
     print(f"Dokładność (tolerancja {tol_desc}) 2025: {pct:.2f}% (n={len(y_true)})")
+    import pandas as _pd
+    _pd.DataFrame([{"metric":"tolerance_accuracy","value":acc,"n":len(y_true),"order":str(order),"tolerance":tol_desc}]).to_csv(METRICS_CSV, index=False)
     plt.figure(figsize=(12, 5))
     plt.plot(y_true.index, y_true.values, label="Rzeczywiste 2025")
     plt.plot(y_pred.index, y_pred.values, label="Prognoza ARIMA (1-krok)")
-    plt.title("USD/PLN — ARIMA(1,1,1) prognozy wartości 2025")
+    plt.title(f"USD/PLN — ARIMA{order} prognozy wartości 2025")
     plt.xlabel("Data")
     plt.ylabel("Zamknięcie")
     plt.legend()
