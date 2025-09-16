@@ -2,10 +2,40 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestRegressor
 import yfinance as yf
+try:
+    from xgboost import XGBRegressor
+except Exception as _e:
+    import sys, platform
+    print("XGBoost nie jest gotowy (brak biblioteki libomp/xgboost).")
+    print("Na macOS zainstaluj:")
+    print("  brew install libomp")
+    print("potem (w wirtualnym środowisku):")
+    print("  pip install --upgrade xgboost")
+    if platform.system() == "Darwin":
+        print("Jeśli nadal błąd, ustaw ścieżkę bibliotek (Apple Silicon):")
+        print("  export DYLD_LIBRARY_PATH=/opt/homebrew/opt/libomp/lib:$DYLD_LIBRARY_PATH")
+        print("lub (Intel):")
+        print("  export DYLD_LIBRARY_PATH=/usr/local/opt/libomp/lib:$DYLD_LIBRARY_PATH")
+    sys.exit(1)
 
 DATA_RAW = "data/raw/usdpln_yahoo_daily.csv"
+REPORT_DIR = "data/reports/xgb"
+METRICS_CSV = os.path.join(REPORT_DIR, "metrics_price_2025.csv")
+TRAIN_END = pd.Timestamp("2024-12-31")
+
+# Konfiguracja
+N_EST = 300
+MAX_DEPTH = 6
+ETA = 0.1
+SUBSAMPLE = 0.8
+COLSAMPLE = 0.8
+REG_LAMBDA = 1.0
+SEED = 42
+WALK_FORWARD = True
+TOL_ABS = 0.01
+TOL_PCT = 0.0
+
 
 def load_or_fetch():
     if os.path.exists(DATA_RAW):
@@ -35,22 +65,26 @@ def load_or_fetch():
     df.to_csv(DATA_RAW)
     return df
 
+
 def prepare_series(df: pd.DataFrame) -> pd.Series:
     s = df["Close"].astype(float).sort_index()
-    s = s.asfreq("B").interpolate()
+    s = s.asfreq("B").ffill().bfill()
     return s
+
 
 def ema(s: pd.Series, span: int) -> pd.Series:
     return s.ewm(span=span, adjust=False).mean()
+
 
 def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1/window, adjust=False).mean()
-    roll_down = down.ewm(alpha=1/window, adjust=False).mean()
+    roll_up = up.ewm(alpha=1 / window, adjust=False).mean()
+    roll_down = down.ewm(alpha=1 / window, adjust=False).mean()
     rs = roll_up / (roll_down + 1e-12)
     return 100 - (100 / (1 + rs))
+
 
 def make_features(close: pd.Series) -> pd.DataFrame:
     close = close.copy()
@@ -87,10 +121,8 @@ def make_features(close: pd.Series) -> pd.DataFrame:
     std20 = close.rolling(20).std()
     upper = sma20 + 2 * std20
     lower = sma20 - 2 * std20
-    width = (upper - lower) / sma20
-    pb = (close - lower) / (upper - lower)
-    X["bb_width20"] = width
-    X["bb_percent_b20"] = pb
+    X["bb_width20"] = (upper - lower) / sma20
+    X["bb_percent_b20"] = (close - lower) / (upper - lower)
     X["zscore_20"] = (close - sma20) / (std20 + 1e-12)
 
     for w in (5, 10, 20):
@@ -111,15 +143,6 @@ def make_features(close: pd.Series) -> pd.DataFrame:
 
     return X
 
-REPORT_DIR = "data/reports/rf"
-
-# Konfiguracja
-N_EST = 400
-MAX_DEPTH = 12
-SEED = 42
-WALK_FORWARD = True
-TOL_ABS = 0.01
-TOL_PCT = 0.0
 
 def build_dataset(close: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     X = make_features(close)
@@ -127,23 +150,35 @@ def build_dataset(close: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
     df = X.copy()
     df["target"] = y
     df = df.dropna()
-    X = df.drop(columns=["target"]) 
-    y = df["target"]
-    return X, y
+    return df.drop(columns=["target"]), df["target"]
 
-def train_once_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, n_estimators: int, max_depth: int, random_state: int) -> tuple[pd.Series, pd.Series, RandomForestRegressor]:
+
+def train_once_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, params: dict):
     train_mask = X.index.year <= 2024
     test_mask = X.index.year == 2025
     X_train, y_train = X.loc[train_mask], y.loc[train_mask]
-    X_test, y_test = X.loc[test_mask], y.loc[test_mask]
-    model = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state, n_jobs=-1)
+    X_test = X.loc[test_mask]
+
+    model = XGBRegressor(
+        n_estimators=params.get("n_estimators", 300),
+        max_depth=params.get("max_depth", 6),
+        learning_rate=params.get("learning_rate", 0.1),
+        subsample=params.get("subsample", 0.8),
+        colsample_bytree=params.get("colsample_bytree", 0.8),
+        reg_lambda=params.get("reg_lambda", 1.0),
+        objective="reg:squarederror",
+        tree_method=params.get("tree_method", "hist"),
+        random_state=params.get("seed", 42),
+        n_jobs=-1,
+    )
     model.fit(X_train, y_train)
-    y_ret_pred = pd.Series(model.predict(X_test), index=X_test.index)
-    y_pred = close.loc[X_test.index] * np.exp(y_ret_pred)
+    ret_pred = pd.Series(model.predict(X_test), index=X_test.index)
+    y_pred = close.loc[X_test.index] * np.exp(ret_pred)
     y_true = close.shift(-1).loc[X_test.index]
     return y_pred, y_true, model
 
-def walk_forward_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, n_estimators: int, max_depth: int, random_state: int) -> tuple[pd.Series, pd.Series]:
+
+def walk_forward_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, params: dict):
     test_idx = X.index[X.index.year == 2025]
     preds = []
     n = len(test_idx)
@@ -151,7 +186,18 @@ def walk_forward_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, n
     for i, d in enumerate(test_idx):
         prev_date = X.index[X.index.get_loc(d) - 1]
         train_mask = X.index <= prev_date
-        model = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=random_state, n_jobs=-1)
+        model = XGBRegressor(
+            n_estimators=params.get("n_estimators", 300),
+            max_depth=params.get("max_depth", 6),
+            learning_rate=params.get("learning_rate", 0.1),
+            subsample=params.get("subsample", 0.8),
+            colsample_bytree=params.get("colsample_bytree", 0.8),
+            reg_lambda=params.get("reg_lambda", 1.0),
+            objective="reg:squarederror",
+            tree_method=params.get("tree_method", "hist"),
+            random_state=params.get("seed", 42),
+            n_jobs=-1,
+        )
         model.fit(X.loc[train_mask], y.loc[train_mask])
         ret_pred = float(model.predict(X.loc[[d]])[0])
         price_pred = float(close.loc[d]) * float(np.exp(ret_pred))
@@ -164,7 +210,8 @@ def walk_forward_predict_2025(close: pd.Series, X: pd.DataFrame, y: pd.Series, n
     y_true = close.shift(-1).loc[test_idx]
     return y_pred, y_true
 
-def evaluate_tolerance(y_true: pd.Series, y_pred: pd.Series, tol_abs: float, tol_pct: float) -> tuple[float, str]:
+
+def evaluate_tolerance(y_true: pd.Series, y_pred: pd.Series, tol_abs: float, tol_pct: float):
     if tol_pct > 0:
         tol = y_true.abs() * (tol_pct / 100.0)
         desc = f"{tol_pct}%"
@@ -175,13 +222,14 @@ def evaluate_tolerance(y_true: pd.Series, y_pred: pd.Series, tol_abs: float, tol
     acc = float(correct.mean())
     return acc, desc
 
+
 def plot_predictions(close: pd.Series, y_pred: pd.Series, out_png: str):
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     plt.figure(figsize=(12, 5))
     c = close.loc[y_pred.index]
     plt.plot(c.index, c.values, label="Rzeczywiste 2025")
-    plt.plot(y_pred.index, y_pred.values, label="Prognoza RF")
-    plt.title("USD/PLN — Random Forest wartość 2025")
+    plt.plot(y_pred.index, y_pred.values, label="Prognoza XGB")
+    plt.title("USD/PLN — XGBoost wartość 2025")
     plt.xlabel("Data")
     plt.ylabel("Zamknięcie")
     plt.legend()
@@ -189,18 +237,33 @@ def plot_predictions(close: pd.Series, y_pred: pd.Series, out_png: str):
     plt.savefig(out_png, dpi=150)
     print(f"Wykres zapisano: {out_png}")
 
+
 def main():
     os.makedirs(REPORT_DIR, exist_ok=True)
     df = load_or_fetch()
     close = prepare_series(df)
     X, y = build_dataset(close)
+
+    params = dict(
+        n_estimators=N_EST,
+        max_depth=MAX_DEPTH,
+        learning_rate=ETA,
+        subsample=SUBSAMPLE,
+        colsample_bytree=COLSAMPLE,
+        reg_lambda=REG_LAMBDA,
+        seed=SEED,
+    )
+
     if WALK_FORWARD:
-        y_pred, y_true = walk_forward_predict_2025(close, X, y, N_EST, MAX_DEPTH, SEED)
+        y_pred, y_true = walk_forward_predict_2025(close, X, y, params)
     else:
-        y_pred, y_true, _ = train_once_predict_2025(close, X, y, N_EST, MAX_DEPTH, SEED)
+        y_pred, y_true, _ = train_once_predict_2025(close, X, y, params)
+
     acc, desc = evaluate_tolerance(y_true, y_pred, TOL_ABS, TOL_PCT)
     print(f"Dokładność (tolerancja {desc}) 2025: {acc*100:.2f}% (n={len(y_true)})")
+    pd.DataFrame([{"tolerance_accuracy": acc, "tolerance": desc, "n": int(len(y_true)), "mode": "walk" if WALK_FORWARD else "train_once"}]).to_csv(METRICS_CSV, index=False)
     plot_predictions(close, y_pred, os.path.join(REPORT_DIR, "price_2025.png"))
+
 
 if __name__ == "__main__":
     main()

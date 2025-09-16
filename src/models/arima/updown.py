@@ -9,7 +9,11 @@ from statsmodels.tsa.arima.model import ARIMA
 DATA_RAW = "data/raw/usdpln_yahoo_daily.csv"
 REPORT_PLOT_2025 = "data/reports/arima/updown_2025.png"
 METRICS_CSV = "data/reports/arima/metrics_updown_2025.csv"
-TRAIN_END = pd.Timestamp("2024-12-31")
+TRAIN_END = pd.Timestamp("2023-12-31")
+
+# Konfiguracja
+AUTO_AIC = False
+ORDER = (1, 1, 1)
 
 def fetch_usdpln() -> pd.DataFrame:
     df = yf.download("USDPLN=X", interval="1d", auto_adjust=False, progress=False)
@@ -75,8 +79,7 @@ def arima_predict_direction_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd
     series = series.copy().asfreq("B").ffill().bfill()
     if series.index.min() > TRAIN_END:
         raise ValueError("Za mało historii: brak danych przed 2025")
-    test_year = 2025
-    test_idx = series.index[series.index.year == test_year]
+    test_idx = series.index[series.index.year == 2025]
     if len(test_idx) == 0:
         raise ValueError("Brak danych na rok 2025")
     preds = []
@@ -109,16 +112,12 @@ def arima_predict_direction_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd
     return y_pred, accuracy
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="ARIMA dla USD/PLN — kierunek 2025")
-    parser.add_argument("--auto-aic", action="store_true")
-    args = parser.parse_args()
     os.makedirs("data/raw", exist_ok=True)
     os.makedirs("data/reports/arima", exist_ok=True)
     df = load_or_fetch()
     s = prepare_series(df)
-    order = (1,1,1)
-    if args.auto_aic:
+    order = ORDER
+    if AUTO_AIC:
         base_train = s.loc[:TRAIN_END]
         order = select_arima_order(base_train)
         print(f"Wybrany porządek (AIC): {order}")

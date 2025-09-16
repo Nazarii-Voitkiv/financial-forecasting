@@ -12,6 +12,12 @@ REPORT_PLOT_2025 = "data/reports/arima/price_2025.png"
 METRICS_CSV = "data/reports/arima/metrics_price_2025.csv"
 TRAIN_END = pd.Timestamp("2024-12-31")
 
+# Konfiguracja
+AUTO_AIC = False
+ORDER = (1, 1, 1)
+TOL_ABS = 0.01
+TOL_PCT = 0.0
+
 def fetch_usdpln() -> pd.DataFrame:
     df = yf.download("USDPLN=X", interval="1d", auto_adjust=False, progress=False)
     df = df.dropna().sort_index()
@@ -76,8 +82,7 @@ def arima_forecast_values_2025(series: pd.Series, order=(1, 1, 1)) -> Tuple[pd.S
     series = series.copy().asfreq("B").ffill().bfill()
     if series.index.min() > TRAIN_END:
         raise ValueError("Za mało historii: brak danych przed 2025")
-    test_year = 2025
-    test_idx = series.index[series.index.year == test_year]
+    test_idx = series.index[series.index.year == 2025]
     if len(test_idx) == 0:
         raise ValueError("Brak danych na rok 2025")
     preds = []
@@ -111,25 +116,19 @@ def main():
     os.makedirs("data/reports/arima", exist_ok=True)
     df = load_or_fetch()
     s = prepare_series(df)
-    import argparse
-    parser = argparse.ArgumentParser(description="Prognoza dokładnej ceny USD/PLN na 2025 z ARIMA")
-    parser.add_argument("--tol-abs", type=float, default=0.02)
-    parser.add_argument("--tol-pct", type=float, default=0.0)
-    parser.add_argument("--auto-aic", action="store_true")
-    args = parser.parse_args()
-    order = (1,1,1)
-    if args.auto_aic:
+    order = ORDER
+    if AUTO_AIC:
         base_train = s.loc[:TRAIN_END]
         order = select_arima_order(base_train)
         print(f"Wybrany porządek (AIC): {order}")
     print(f"ARIMA{order} USD/PLN — wartość 2025")
     y_pred, y_true = arima_forecast_values_2025(s, order=order)
-    if args.tol_pct > 0:
-        tol = y_true.abs() * (args.tol_pct / 100.0)
-        tol_desc = f"{args.tol_pct:.3g}%"
+    if TOL_PCT > 0:
+        tol = y_true.abs() * (TOL_PCT / 100.0)
+        tol_desc = f"{TOL_PCT:.3g}%"
     else:
-        tol = pd.Series(args.tol_abs, index=y_true.index)
-        tol_desc = f"{args.tol_abs} PLN"
+        tol = pd.Series(TOL_ABS, index=y_true.index)
+        tol_desc = f"{TOL_ABS} PLN"
     correct = ((y_true - y_pred).abs() <= tol).astype(int)
     acc = float(correct.mean())
     pct = acc * 100
