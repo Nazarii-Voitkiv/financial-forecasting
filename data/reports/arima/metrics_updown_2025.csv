@@ -1,2 +1,2 @@
-metric,value,n,order
-accuracy,0.5901639344262295,183,"(1, 1, 1)"
+metric,value,n,order,year,mode,model
+accuracy,0.5901639344262295,183,AR(10),2025,walk,autoreg_updown
