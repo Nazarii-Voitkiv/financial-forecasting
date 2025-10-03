@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, matthews_corrcoef, roc_auc_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, matthews_corrcoef, roc_auc_score, roc_curve
 
 try:
     from xgboost import XGBClassifier
@@ -35,14 +35,16 @@ TRAIN_END = pd.Timestamp(f"{EVAL_YEAR-1}-12-31")
 
 
 # Konfiguracja
-N_EST = 300
-MAX_DEPTH = 6
-ETA = 0.1
-SUBSAMPLE = 0.8
-COLSAMPLE = 0.8
-REG_LAMBDA = 1.0
+N_EST = int(os.getenv("XGB_N_EST", "800"))
+MAX_DEPTH = int(os.getenv("XGB_MAX_DEPTH", "4"))
+ETA = float(os.getenv("XGB_ETA", "0.03"))
+SUBSAMPLE = float(os.getenv("XGB_SUBSAMPLE", "0.8"))
+COLSAMPLE = float(os.getenv("XGB_COLSAMPLE", "0.6"))
+REG_LAMBDA = float(os.getenv("XGB_REG_LAMBDA", "2.0"))
 SEED = 42
-WALK_FORWARD = True
+WALK_FORWARD = bool(int(os.getenv("XGB_WALK_FORWARD", "1")))
+WALK_STEP = int(os.getenv("XGB_WALK_STEP", "20"))  # raz na ~місяць
+VAL_DAYS = 120
 THRESH = 0.5
 OPT_THRESH = True
 FEATURE_CONFIG = FeatureConfig()
@@ -77,29 +79,19 @@ def _xgb_classifier(params: dict) -> XGBClassifier:
     )
 
 
-def _calibrate_threshold(
-    model: XGBClassifier,
-    X: pd.DataFrame,
-    y: pd.Series,
-    base_threshold: float,
-) -> float:
+def _calibrate_threshold(model: XGBClassifier, X: pd.DataFrame, y: pd.Series, base_threshold: float) -> float:
     val_mask_all = X.index.year == (EVAL_YEAR - 1)
     if not val_mask_all.any():
         return base_threshold
     last_date = X.index[val_mask_all].max()
-    val_mask = (X.index >= last_date - pd.Timedelta(days=120)) & val_mask_all
+    val_mask = (X.index >= last_date - pd.Timedelta(days=VAL_DAYS)) & val_mask_all
     if not val_mask.any():
         return base_threshold
     val_probs = model.predict_proba(X.loc[val_mask])[:, 1]
     val_true = y.loc[val_mask].values
-    grid = np.linspace(0.3, 0.7, 41)
-    best_thresh, best_acc = base_threshold, -1.0
-    for t in grid:
-        acc = ((val_probs >= t).astype(int) == val_true).mean()
-        if acc > best_acc:
-            best_acc = acc
-            best_thresh = float(t)
-    return best_thresh
+    fpr, tpr, thr = roc_curve(val_true, val_probs)
+    j = tpr - fpr
+    return float(thr[int(np.argmax(j))])
 
 
 def train_once_predict_2025(
@@ -126,28 +118,30 @@ def train_once_predict_2025(
     return pd.Series(y_pred, index=X_test.index), y_test, probs, best_thresh, model
 
 
-def walk_forward_predict_2025(
-    X: pd.DataFrame,
-    y: pd.Series,
-    params: dict,
-):
+def walk_forward_predict_2025(X: pd.DataFrame, y: pd.Series, params: dict, threshold: float):
     test_idx = X.index[X.index.year == EVAL_YEAR]
-    preds = []
-    probs = []
+    preds, probs = [], []
     n = len(test_idx)
     last_print = None
+    model: Optional[XGBClassifier] = None
+
     for i, d in enumerate(test_idx):
-        prev_date = X.index[X.index.get_loc(d) - 1]
-        train_mask = X.index <= prev_date
-        model = _xgb_classifier(params)
-        model.fit(X.loc[train_mask], y.loc[train_mask])
-        p = model.predict_proba(X.loc[[d]])[0, 1]
-        probs.append(float(p))
-        preds.append(1 if p >= 0.5 else 0)
+        if (model is None) or (i % WALK_STEP == 0):
+            prev_date = X.index[X.index.get_loc(d) - 1]
+            train_mask = X.index <= prev_date
+            Xtr, ytr = X.loc[train_mask], y.loc[train_mask]
+            model = _xgb_classifier(params)
+            model.fit(Xtr, ytr)
+
+        p = float(model.predict_proba(X.loc[[d]])[0, 1])
+        probs.append(p)
+        preds.append(1 if p >= threshold else 0)
+
         remaining = int(round(100 * (1 - (i + 1) / n)))
         if last_print is None or remaining != last_print:
             print(f"Pozostało: {remaining}%")
             last_print = remaining
+
     y_pred = pd.Series(preds, index=test_idx)
     y_test = y.loc[test_idx]
     return y_pred, y_test, np.array(probs)
@@ -229,11 +223,16 @@ def main():
         seed=SEED,
     )
 
+    # 0) підготовка моделі/порогу на до-2025
+    model0 = _xgb_classifier(params)
+    mask_train = X.index.year < EVAL_YEAR
+    Xtr0, ytr0 = X.loc[mask_train], y.loc[mask_train]
+    model0.fit(Xtr0, ytr0)
+    used_thresh = _calibrate_threshold(model0, X, y, THRESH)
+    model = model0
+
     if WALK_FORWARD:
-        y_pred, y_test, y_prob = walk_forward_predict_2025(X, y, params)
-        used_thresh = 0.5
-        model = _xgb_classifier(params)
-        model.fit(X.loc[X.index.year < EVAL_YEAR], y.loc[y.index.year < EVAL_YEAR])
+        y_pred, y_test, y_prob = walk_forward_predict_2025(X, y, params, used_thresh)
     else:
         y_pred, y_test, y_prob, used_thresh, model = train_once_predict_2025(
             X, y, params, THRESH, OPT_THRESH
@@ -251,6 +250,7 @@ def main():
         f"Dokładność up/down {EVAL_YEAR}: {acc*100:.2f}% (95% CI {lo*100:.1f}-{hi*100:.1f}) (n={len(y_pred)}) — próg {used_thresh:.2f}"
     )
     print(f"Balanced Acc: {bacc*100:.2f}%  MCC: {mcc:.3f}  ROC-AUC: {auc:.3f}  Baseline: 50.00%")
+    print(f"UP rate 2025 — true: {float(y_test.mean()):.3f}, pred: {float(y_pred.mean()):.3f}")
 
     pd.DataFrame(
         [
@@ -265,6 +265,8 @@ def main():
                 "threshold": float(used_thresh),
                 "mode": "walk" if WALK_FORWARD else "train_once",
                 "year": int(EVAL_YEAR),
+                "family": "xgb",
+                "task": "updown",
             }
         ]
     ).to_csv(METRICS_CSV, index=False)

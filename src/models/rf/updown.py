@@ -17,14 +17,16 @@ METRICS_CSV = os.path.join(REPORT_DIR, f"metrics_updown_{EVAL_YEAR}.csv")
 
 
 # Konfiguracja
-N_EST = int(os.getenv("RF_N_EST", "400"))
-MAX_DEPTH = int(os.getenv("RF_MAX_DEPTH", "12"))
+N_EST = int(os.getenv("RF_N_EST", "200"))
+MAX_DEPTH = int(os.getenv("RF_MAX_DEPTH", "8"))
 SEED = 42
 WALK_FORWARD = bool(int(os.getenv("RF_WALK_FORWARD", "1")))
-WALK_STEP = max(1, int(os.getenv("RF_WALK_STEP", "1")))
+WALK_STEP = max(1, int(os.getenv("RF_WALK_STEP", "20")))
 THRESH = 0.5
 OPT_THRESH = True
-FEATURE_CONFIG = FeatureConfig()
+FEATURE_CONFIG = FeatureConfig(
+    lag_returns=5, momentum_windows=(), sma_windows=(5,), volatility_windows=(), rsi_windows=()
+)
 
 
 def prepare_series(df: pd.DataFrame) -> pd.Series:
@@ -81,6 +83,8 @@ def train_once_predict_2025(
     model = RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
+        min_samples_leaf=5,
+        max_features="sqrt",
         random_state=random_state,
         n_jobs=-1,
         class_weight="balanced",
@@ -100,26 +104,31 @@ def walk_forward_predict_2025(
     n_estimators: int,
     max_depth: int,
     random_state: int,
+    threshold: float,
 ) -> tuple[pd.Series, pd.Series, np.ndarray]:
     test_idx = X.index[X.index.year == EVAL_YEAR]
     preds: list[int] = []
     probs: list[float] = []
     n = len(test_idx)
     last_print = None
+    model: Optional[RandomForestClassifier] = None
     for i, d in enumerate(test_idx):
-        prev_date = X.index[X.index.get_loc(d) - 1]
-        train_mask = X.index <= prev_date
-        model = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            random_state=random_state,
-            n_jobs=-1,
-            class_weight="balanced",
-        )
-        model.fit(X.loc[train_mask], y.loc[train_mask])
+        if model is None or i % WALK_STEP == 0:
+            prev_date = X.index[X.index.get_loc(d) - 1]
+            train_mask = X.index <= prev_date
+            model = RandomForestClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                min_samples_leaf=5,
+                max_features="sqrt",
+                random_state=random_state,
+                n_jobs=-1,
+                class_weight="balanced",
+            )
+            model.fit(X.loc[train_mask], y.loc[train_mask])
         p = model.predict_proba(X.loc[[d]])[0, 1]
         probs.append(float(p))
-        preds.append(1 if p >= 0.5 else 0)
+        preds.append(1 if p >= threshold else 0)
         remaining = int(round(100 * (1 - (i + 1) / n)))
         if last_print is None or remaining != last_print:
             print(f"Pozostało: {remaining}%")
@@ -195,17 +204,24 @@ def main():
     df = load_or_fetch()
     close = prepare_series(df)
     X, y = build_dataset(close, FEATURE_CONFIG)
+
+    # 1) base model trained on pre-2025 data to calibrate threshold and get feature importances
+    base_model = RandomForestClassifier(
+        n_estimators=N_EST,
+        max_depth=MAX_DEPTH,
+        min_samples_leaf=5,
+        max_features="sqrt",
+        random_state=SEED,
+        n_jobs=-1,
+        class_weight="balanced",
+    )
+    mask_train_pre_2025 = X.index.year < EVAL_YEAR
+    base_model.fit(X.loc[mask_train_pre_2025], y.loc[mask_train_pre_2025])
+    used_thresh = _calibrate_threshold(base_model, X, y, THRESH)
+    model = base_model  # for feature importance report
+
     if WALK_FORWARD:
-        y_pred, y_test, y_prob = walk_forward_predict_2025(X, y, N_EST, MAX_DEPTH, SEED)
-        model = RandomForestClassifier(
-            n_estimators=N_EST,
-            max_depth=MAX_DEPTH,
-            random_state=SEED,
-            n_jobs=-1,
-            class_weight="balanced",
-        )
-        model.fit(X.loc[X.index.year < EVAL_YEAR], y.loc[y.index.year < EVAL_YEAR])
-        used_thresh = 0.5
+        y_pred, y_test, y_prob = walk_forward_predict_2025(X, y, N_EST, MAX_DEPTH, SEED, used_thresh)
     else:
         y_pred, y_test, y_prob, used_thresh, model = train_once_predict_2025(
             X,
@@ -229,6 +245,7 @@ def main():
     )
     print(f"Balanced Acc: {bacc*100:.2f}%  MCC: {mcc:.3f}  ROC-AUC: {auc:.3f}  Baseline: 50.00%")
 
+    # Add family/task metadata and write metrics
     pd.DataFrame(
         [
             {
@@ -242,6 +259,8 @@ def main():
                 "threshold": float(used_thresh),
                 "mode": "walk" if WALK_FORWARD else "train_once",
                 "year": int(EVAL_YEAR),
+                "family": "rf",
+                "task": "updown",
             }
         ]
     ).to_csv(METRICS_CSV, index=False)

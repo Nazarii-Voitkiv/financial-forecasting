@@ -34,15 +34,15 @@ TRAIN_END = pd.Timestamp(f"{EVAL_YEAR-1}-12-31")
 
 
 # Konfiguracja
-N_EST = 300
-MAX_DEPTH = 6
-ETA = 0.1
-SUBSAMPLE = 0.8
-COLSAMPLE = 0.8
-REG_LAMBDA = 1.0
+N_EST = int(os.getenv("XGB_N_EST", "1200"))
+MAX_DEPTH = int(os.getenv("XGB_MAX_DEPTH", "4"))
+ETA = float(os.getenv("XGB_ETA", "0.03"))
+SUBSAMPLE = float(os.getenv("XGB_SUBSAMPLE", "0.8"))
+COLSAMPLE = float(os.getenv("XGB_COLSAMPLE", "0.6"))
+REG_LAMBDA = float(os.getenv("XGB_REG_LAMBDA", "2.0"))
 SEED = 42
-WALK_FORWARD = True
 WALK_FORWARD = bool(int(os.getenv("XGB_WALK_FORWARD", "1")))
+WALK_STEP = int(os.getenv("XGB_WALK_STEP", "20"))
 TOL_ABS = 0.01
 TOL_PCT = 0.0
 FEATURE_CONFIG = FeatureConfig()
@@ -89,34 +89,36 @@ def train_once_predict_2025(
 
     model = _xgb_regressor(params)
     model.fit(X_train, y_train)
+
     ret_pred = pd.Series(model.predict(X_test), index=X_test.index)
     y_pred = close.loc[X_test.index] * np.exp(ret_pred)
     y_true = close.shift(-1).loc[X_test.index]
     return y_pred, y_true, model
 
 
-def walk_forward_predict_2025(
-    close: pd.Series,
-    X: pd.DataFrame,
-    y: pd.Series,
-    params: dict,
-):
+def walk_forward_predict_2025(close, X, y, params):
     test_idx = X.index[X.index.year == EVAL_YEAR]
     preds = []
     n = len(test_idx)
     last_print = None
+    model = None
+
     for i, d in enumerate(test_idx):
-        prev_date = X.index[X.index.get_loc(d) - 1]
-        train_mask = X.index <= prev_date
-        model = _xgb_regressor(params)
-        model.fit(X.loc[train_mask], y.loc[train_mask])
-        ret_pred = float(model.predict(X.loc[[d]])[0])
-        price_pred = float(close.loc[d]) * float(np.exp(ret_pred))
-        preds.append(price_pred)
+        if (model is None) or (i % WALK_STEP == 0):
+            prev_date = X.index[X.index.get_loc(d) - 1]
+            mask = X.index <= prev_date
+            Xt, yt = X.loc[mask], y.loc[mask]
+            model = _xgb_regressor(params)
+            model.fit(Xt, yt)
+
+        r = float(model.predict(X.loc[[d]])[0])
+        preds.append(float(close.loc[d]) * float(np.exp(r)))
+
         remaining = int(round(100 * (1 - (i + 1) / n)))
         if last_print is None or remaining != last_print:
             print(f"Pozostało: {remaining}%")
             last_print = remaining
+
     y_pred = pd.Series(preds, index=test_idx)
     y_true = close.shift(-1).loc[test_idx]
     return y_pred, y_true
@@ -171,6 +173,8 @@ def main():
                 "mode": "walk" if WALK_FORWARD else "train_once",
                 "year": int(EVAL_YEAR),
                 "model": "xgb_price",
+                "family": "xgb",
+                "task": "price",
             }
         ]
     ).to_csv(METRICS_CSV, index=False)

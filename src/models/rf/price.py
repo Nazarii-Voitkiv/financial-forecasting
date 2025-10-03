@@ -16,14 +16,16 @@ METRICS_CSV = os.path.join(REPORT_DIR, f"metrics_price_{EVAL_YEAR}.csv")
 
 
 # Konfiguracja
-N_EST = int(os.getenv("RF_N_EST", "400"))
-MAX_DEPTH = int(os.getenv("RF_MAX_DEPTH", "12"))
+N_EST = int(os.getenv("RF_N_EST", "200"))
+MAX_DEPTH = int(os.getenv("RF_MAX_DEPTH", "8"))
 SEED = 42
 WALK_FORWARD = bool(int(os.getenv("RF_WALK_FORWARD", "1")))
-WALK_STEP = max(1, int(os.getenv("RF_WALK_STEP", "1")))
+WALK_STEP = max(1, int(os.getenv("RF_WALK_STEP", "20")))
 TOL_ABS = 0.01
 TOL_PCT = 0.0
-FEATURE_CONFIG = FeatureConfig()
+FEATURE_CONFIG = FeatureConfig(
+    lag_returns=5, momentum_windows=(), sma_windows=(5,), volatility_windows=(), rsi_windows=()
+)
 
 
 def prepare_series(df: pd.DataFrame) -> pd.Series:
@@ -54,6 +56,8 @@ def train_once_predict_2025(
     model = RandomForestRegressor(
         n_estimators=n_estimators,
         max_depth=max_depth,
+        min_samples_leaf=5,
+        max_features="sqrt",
         random_state=random_state,
         n_jobs=-1,
     )
@@ -84,6 +88,8 @@ def walk_forward_predict_2025(
             model = RandomForestRegressor(
                 n_estimators=n_estimators,
                 max_depth=max_depth,
+                min_samples_leaf=5,
+                max_features="sqrt",
                 random_state=random_state,
                 n_jobs=-1,
             )
@@ -127,6 +133,7 @@ def main():
     acc, desc = evaluate_tolerance(y_true, y_pred, TOL_ABS, TOL_PCT)
     print(f"Dokładność (tolerancja {desc}) {EVAL_YEAR}: {acc*100:.2f}% (n={len(y_true)})")
     metrics = regression_metrics(y_true, y_pred)
+    # Add family/task metadata and write metrics
     pd.DataFrame(
         [
             {
@@ -137,9 +144,23 @@ def main():
                 "mode": "walk" if WALK_FORWARD else "train_once",
                 "year": int(EVAL_YEAR),
                 "model": "rf_price",
+                "family": "rf",
+                "task": "price",
             }
         ]
     ).to_csv(METRICS_CSV, index=False)
+
+    # Save feature importances for regressor
+    try:
+        imp_df = pd.DataFrame({"feature": X.columns, "importance": _.feature_importances_})
+        imp_df = imp_df.sort_values("importance", ascending=False)
+        imp_csv = os.path.join(REPORT_DIR, f"feature_importance_{EVAL_YEAR-1}.csv")
+        os.makedirs(os.path.dirname(imp_csv), exist_ok=True)
+        imp_df.to_csv(imp_csv, index=False)
+        print(f"Zapisano ważności cech: {imp_csv}")
+    except Exception:
+        # If model object not present (e.g., walk-forward mode without final model), skip
+        pass
     plot_predictions(close, y_pred, y_true, acc, os.path.join(REPORT_DIR, f"price_{EVAL_YEAR}.png"))
 
 
