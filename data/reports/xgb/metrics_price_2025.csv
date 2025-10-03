@@ -1,2 +1,2 @@
-mae,rmse,medae,mape,tolerance_accuracy,tolerance,n,mode,year,model,family,task
-0.017845470741917627,0.022793071677397025,0.014192519585195962,0.4650798718145832,0.34065934065934067,0.01 PLN,182,walk,2025,xgb_price,xgb,price
+mae,rmse,medae,mape,tolerance_accuracy,tolerance,n,mode,year,family,task,model
+0.01691687379190493,0.022052199445991655,0.013536496489033212,0.4403951271557986,0.3901098901098901,0.01 PLN,182,walk_forward,2025,xgb,price,stacked_arima_xgb

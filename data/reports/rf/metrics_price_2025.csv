@@ -1,2 +1,0 @@
-mae,rmse,medae,mape,tolerance_accuracy,tolerance,n,mode,year,model,family,task
-0.016942550249796292,0.022078231267655093,0.012593382360969851,0.4413268504590059,0.37362637362637363,0.01 PLN,182,walk,2025,rf_price,rf,price
